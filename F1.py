@@ -186,6 +186,11 @@ def camera_thread_worker():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+    try:
+        cv2.namedWindow("Gesture Camera", cv2.WINDOW_NORMAL)
+    except:
+        pass
+
     # Steering smoothing state (EMA)
     STEER_SMOOTHING = 0.25  # Lower = smoother (0.0-1.0)
     smoothed_steering = 0.0
@@ -297,20 +302,27 @@ def camera_thread_worker():
             cv2.putText(pip_canvas, "PLACE BOTH HANDS IN CAMERA VIEW", (40, 260), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 150, 255), 2, cv2.LINE_AA)
 
-        # Crop and resize to exactly 200x150
-        pip_resized = cv2.resize(pip_canvas, (200, 150))
-        pip_rgb = cv2.cvtColor(pip_resized, cv2.COLOR_BGR2RGB)
+        # Display the camera feed in the separate window
+        try:
+            cv2.imshow("Gesture Camera", pip_canvas)
+            cv2.waitKey(1)
+        except:
+            pass
 
         with state_lock:
             hand_state.steering = smoothed_steering
             hand_state.drs_active = drs_active_val
-            hand_state.camera_frame = pip_rgb
+            hand_state.camera_frame = None  # No longer blitted in Pygame
             hand_state.hand_detected = hand_detected_val
 
         time.sleep(0.01)
 
     cap.release()
     detector.close()
+    try:
+        cv2.destroyWindow("Gesture Camera")
+    except:
+        pass
 
 # ==============================================================================
 #                             PARTICLE CLASSES
@@ -429,6 +441,7 @@ def main():
     # Initialize Pygame
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+    fullscreen = False
     pygame.display.set_caption("f1 game")
     clock = pygame.time.Clock()
     
@@ -458,7 +471,8 @@ def main():
     track_timer = 0
     
     # Game Variables
-    state = "START_SCREEN" # START_SCREEN, PLAYING, GAME_OVER
+    state = "START_SCREEN" # START_SCREEN, PLAYING, GAME_OVER, TIME_TRIAL_COMPLETE
+    game_mode = "ENDLESS" # ENDLESS, TIME_TRIAL
     player_x = SCREEN_WIDTH // 2
     player_steer_speed = 10.0
     
@@ -469,6 +483,7 @@ def main():
     
     score = 0.0
     highscore = 0
+    best_time = 9999.9
     
     # Particles and lists
     particles = []
@@ -479,6 +494,17 @@ def main():
     screen_shake_x = 0
     screen_shake_y = 0
     
+    # Menu selection cooldown
+    menu_cooldown = 0
+    
+    # Time Trial stats
+    time_trial_start_time = 0.0
+    time_trial_elapsed = 0.0
+    TIME_TRIAL_DISTANCE = 2500.0
+    
+    # Track-specific deterministic generator
+    track_random = random.Random()
+    
     # Save High Score to local file
     highscore_file = "highscore.txt"
     if os.path.exists(highscore_file):
@@ -488,9 +514,19 @@ def main():
         except:
             pass
 
+    # Save Best Time to local file
+    best_time_file = "best_time.txt"
+    if os.path.exists(best_time_file):
+        try:
+            with open(best_time_file, "r") as f:
+                best_time = float(f.read().strip())
+        except:
+            pass
+
     def reset_game():
         nonlocal player_x, current_speed, score, road_centers, scroll_accumulator, scroll_distance
         nonlocal current_curvature, target_curvature, particles, speed_lines, traffic_cars, game_over_timer
+        nonlocal time_trial_start_time, time_trial_elapsed, track_random
         player_x = SCREEN_WIDTH // 2
         current_speed = 0.0
         score = 0.0
@@ -503,6 +539,14 @@ def main():
         speed_lines = []
         traffic_cars = []
         game_over_timer = 0
+        
+        if game_mode == "TIME_TRIAL":
+            time_trial_start_time = time.time()
+            time_trial_elapsed = 0.0
+            track_random = random.Random(42) # fixed seed
+        else:
+            track_random = random.Random() # unseeded (randomized)
+
         
     def get_road_center_at_y(y):
         """Calculates interpolated road center at a specific y coordinate."""
@@ -527,6 +571,14 @@ def main():
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 game_running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_f or event.key == pygame.K_F11:
+                    fullscreen = not fullscreen
+                    if fullscreen:
+                        info = pygame.display.Info()
+                        screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.FULLSCREEN | pygame.DOUBLEBUF)
+                    else:
+                        screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.DOUBLEBUF)
                 
         # Read user controls (Gestures with Keyboard Override Fallback)
         keys = pygame.key.get_pressed()
@@ -577,20 +629,24 @@ def main():
             if state == "PLAYING":
                 # 1. Curve and Curvature logic
                 track_timer += 1
-                # Decide track shifts
-                if track_timer > random.randint(120, 240):
+                # Decide track shifts - more frequent turns (every 60-150 frames)
+                if track_timer > track_random.randint(60, 150):
                     track_timer = 0
                     # Self correction if road moves near the edges
-                    if road_centers[0] < 350:
-                        target_curvature = random.uniform(0.5, 2.5)
-                    elif road_centers[0] > 650:
-                        target_curvature = random.uniform(-2.5, -0.5)
+                    if road_centers[0] < 300:
+                        target_curvature = track_random.uniform(1.0, 3.5)
+                    elif road_centers[0] > 700:
+                        target_curvature = track_random.uniform(-3.5, -1.0)
                     else:
-                        # Random turn curvature
-                        target_curvature = random.choice([0.0, 0.0, random.uniform(1.2, 2.6), random.uniform(-2.6, -1.2)])
+                        # Random turn curvature - more curves, higher intensity (up to 3.8)
+                        target_curvature = track_random.choice([
+                            0.0, 
+                            track_random.uniform(1.8, 3.8), 
+                            track_random.uniform(-3.8, -1.8)
+                        ])
                 
-                # Smoothly transition curvature
-                current_curvature += (target_curvature - current_curvature) * 0.04
+                # Smoothly transition curvature - slightly faster transition for dramatic turns
+                current_curvature += (target_curvature - current_curvature) * 0.055
                 
                 # 2. Physics & Off-road penalty
                 road_center_player = get_road_center_at_y(PLAYER_Y)
@@ -611,6 +667,22 @@ def main():
                 
                 # Adjust score
                 score += current_speed * 0.08
+                
+                # Check for Time Trial completion
+                if game_mode == "TIME_TRIAL":
+                    time_trial_elapsed = time.time() - time_trial_start_time
+                    if score >= TIME_TRIAL_DISTANCE:
+                        state = "TIME_TRIAL_COMPLETE"
+                        game_over_timer = 0
+                        new_record = False
+                        if time_trial_elapsed < best_time:
+                            best_time = time_trial_elapsed
+                            new_record = True
+                            try:
+                                with open(best_time_file, "w") as f:
+                                    f.write(f"{best_time:.3f}")
+                            except:
+                                pass
                 
                 # Screen shake when driving at high speed (DRS active)
                 if drs_active and current_speed > base_speed + 2:
@@ -638,6 +710,19 @@ def main():
                 screen_shake_x = 0
                 screen_shake_y = 0
                 
+                # Update menu selection cooldown
+                if menu_cooldown > 0:
+                    menu_cooldown -= 1
+                    
+                # Handle mode selection input
+                if menu_cooldown == 0:
+                    if steer < -0.5:
+                        game_mode = "ENDLESS"
+                        menu_cooldown = 15
+                    elif steer > 0.5:
+                        game_mode = "TIME_TRIAL"
+                        menu_cooldown = 15
+                
                 # Trigger Start
                 if drs_input:
                     state = "PLAYING"
@@ -649,21 +734,21 @@ def main():
             player_x = max(40, min(SCREEN_WIDTH - 40, player_x))
             
             if state == "PLAYING":
-                # 5. Spawning Traffic Cars
-                if len(traffic_cars) < 3 and random.randint(1, 100) == 1:
+                # 5. Spawning Traffic Cars - Increased density and deterministic spawning
+                if len(traffic_cars) < 5 and track_random.randint(1, 50) == 1:
                     # Avoid spawning immediately next to each other
-                    lane = random.choice([-1, 0, 1])
+                    lane = track_random.choice([-1, 0, 1])
                     lane_conflict = False
                     for car in traffic_cars:
-                        if car['lane'] == lane and car['y'] < 200:
+                        if car['lane'] == lane and car['y'] < 150:
                             lane_conflict = True
                             break
                     if not lane_conflict:
                         traffic_cars.append({
                             'lane': lane,
                             'y': -100,
-                            'speed': random.uniform(4.0, 7.5), # Moves slower than road
-                            'color': random.choice([
+                            'speed': track_random.uniform(4.0, 7.5), # Moves slower than road
+                            'color': track_random.choice([
                                 (30, 144, 255),  # Blue
                                 (255, 140, 0),   # Orange
                                 (255, 215, 0),   # Gold
@@ -671,6 +756,7 @@ def main():
                                 (200, 200, 200)  # Silver
                             ])
                         })
+
 
                 # Update Traffic Cars
                 for car in traffic_cars[:]:
@@ -820,29 +906,98 @@ def main():
                         break
 
             # 11. Draw Score Banner at top center
-            score_surface = pygame.Surface((360, 40), pygame.SRCALPHA)
+            score_surface = pygame.Surface((450, 40), pygame.SRCALPHA)
             score_surface.fill((10, 10, 20, 180))
-            pygame.draw.rect(score_surface, (255, 255, 255), (0, 0, 360, 40), 1, border_radius=5)
-            score_txt = font_digital.render(f"DIST: {int(score):04d}m  BEST: {highscore:04d}m", True, (255, 255, 255))
-            score_surface.blit(score_txt, (20, 6))
-            game_surface.blit(score_surface, (SCREEN_WIDTH // 2 - 180, 15))
+            pygame.draw.rect(score_surface, (255, 255, 255), (0, 0, 450, 40), 1, border_radius=5)
             
-            # Start Screen overlay (Teeny Text Box)
+            if game_mode == "ENDLESS":
+                score_txt = font_digital.render(f"DIST: {int(score):04d}m  BEST: {highscore:04d}m", True, (255, 255, 255))
+            else:
+                score_txt = font_digital.render(f"PROGRESS: {int(score):04d}/{int(TIME_TRIAL_DISTANCE)}m  TIME: {time_trial_elapsed:.2f}s", True, (255, 255, 255))
+                
+            score_surface.blit(score_txt, (15, 6))
+            game_surface.blit(score_surface, (SCREEN_WIDTH // 2 - 225, 15))
+            
+            # Draw visual track progress bar in Time Trial
+            if game_mode == "TIME_TRIAL" and state == "PLAYING":
+                bar_w, bar_h = 300, 8
+                bar_x = SCREEN_WIDTH // 2 - bar_w // 2
+                bar_y = 60
+                
+                pygame.draw.rect(game_surface, (60, 60, 70, 150), (bar_x, bar_y, bar_w, bar_h), border_radius=4)
+                progress_ratio = min(1.0, score / TIME_TRIAL_DISTANCE)
+                fill_w = int(bar_w * progress_ratio)
+                if fill_w > 0:
+                    pygame.draw.rect(game_surface, (0, 255, 255), (bar_x, bar_y, fill_w, bar_h), border_radius=4)
+                
+                flag_txt = font_small.render("FINISH", True, (255, 255, 255))
+                game_surface.blit(flag_txt, (bar_x + bar_w + 10, bar_y - 6))
+            
+            # Start Screen overlay Menu
             if state == "START_SCREEN":
-                box_w, box_h = 380, 70
+                box_w, box_h = 650, 320
                 box_surface = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
-                box_surface.fill((10, 10, 20, 220)) # semi-transparent dark back
-                pygame.draw.rect(box_surface, (0, 255, 255), (0, 0, box_w, box_h), 2, border_radius=8)
+                box_surface.fill((10, 10, 20, 230))
+                pygame.draw.rect(box_surface, (0, 255, 255), (0, 0, box_w, box_h), 2, border_radius=12)
                 
-                # Flashing text
+                # Title
+                title_txt = font_medium.render("F1 HAND-GESTURE CHALLENGE", True, (255, 215, 0))
+                box_surface.blit(title_txt, (box_w // 2 - title_txt.get_width() // 2, 20))
+                
+                # Render Mode Panels
+                pw, ph = 260, 160
+                py = 70
+                
+                # Endless Mode Panel (Left)
+                endless_selected = (game_mode == "ENDLESS")
+                el_col = (0, 255, 255) if endless_selected else (60, 60, 70)
+                el_bg = (20, 25, 40, 255) if endless_selected else (15, 15, 20, 255)
+                el_surf = pygame.Surface((pw, ph), pygame.SRCALPHA)
+                el_surf.fill(el_bg)
+                pygame.draw.rect(el_surf, el_col, (0, 0, pw, ph), 2 if endless_selected else 1, border_radius=8)
+                
+                txt_el_title = font_medium.render("ENDLESS MODE", True, el_col)
+                txt_el_best = font_digital.render(f"BEST: {highscore}m", True, (255, 255, 255))
+                txt_el_desc1 = font_small.render("Avoid traffic cars", True, (150, 150, 160))
+                txt_el_desc2 = font_small.render("and go the distance.", True, (150, 150, 160))
+                
+                el_surf.blit(txt_el_title, (pw // 2 - txt_el_title.get_width() // 2, 15))
+                el_surf.blit(txt_el_best, (pw // 2 - txt_el_best.get_width() // 2, 60))
+                el_surf.blit(txt_el_desc1, (pw // 2 - txt_el_desc1.get_width() // 2, 105))
+                el_surf.blit(txt_el_desc2, (pw // 2 - txt_el_desc2.get_width() // 2, 125))
+                
+                box_surface.blit(el_surf, (40, py))
+                
+                # Time Trial Panel (Right)
+                tt_selected = (game_mode == "TIME_TRIAL")
+                tt_col = (0, 255, 255) if tt_selected else (60, 60, 70)
+                tt_bg = (20, 25, 40, 255) if tt_selected else (15, 15, 20, 255)
+                tt_surf = pygame.Surface((pw, ph), pygame.SRCALPHA)
+                tt_surf.fill(tt_bg)
+                pygame.draw.rect(tt_surf, tt_col, (0, 0, pw, ph), 2 if tt_selected else 1, border_radius=8)
+                
+                txt_tt_title = font_medium.render("TIME TRIAL", True, tt_col)
+                bt_str = f"{best_time:.2f}s" if best_time < 9999.0 else "--.--s"
+                txt_tt_best = font_digital.render(f"BEST: {bt_str}", True, (255, 255, 255))
+                txt_tt_desc1 = font_small.render("Race a fixed 2500m", True, (150, 150, 160))
+                txt_tt_desc2 = font_small.render("track as fast as you can.", True, (150, 150, 160))
+                
+                tt_surf.blit(txt_tt_title, (pw // 2 - txt_tt_title.get_width() // 2, 15))
+                tt_surf.blit(txt_tt_best, (pw // 2 - txt_tt_best.get_width() // 2, 60))
+                tt_surf.blit(txt_tt_desc1, (pw // 2 - txt_tt_desc1.get_width() // 2, 105))
+                tt_surf.blit(txt_tt_desc2, (pw // 2 - txt_tt_desc2.get_width() // 2, 125))
+                
+                box_surface.blit(tt_surf, (350, py))
+                
+                # Footer instructions
                 txt_color = (0, 255, 255) if int(time.time() * 2) % 2 == 0 else (240, 240, 240)
-                msg_txt1 = font_medium.render("FINGER GUNS TO START", True, txt_color)
-                msg_txt2 = font_small.render("OR PRESS SPACEBAR", True, (150, 150, 160))
+                footer_txt1 = font_small.render("STEER LEFT/RIGHT or Arrow Keys to toggle mode", True, (200, 200, 200))
+                footer_txt2 = font_medium.render("FINGER GUNS TO START (OR SPACEBAR)", True, txt_color)
                 
-                box_surface.blit(msg_txt1, (box_w // 2 - msg_txt1.get_width() // 2, 8))
-                box_surface.blit(msg_txt2, (box_w // 2 - msg_txt2.get_width() // 2, 40))
+                box_surface.blit(footer_txt1, (box_w // 2 - footer_txt1.get_width() // 2, 245))
+                box_surface.blit(footer_txt2, (box_w // 2 - footer_txt2.get_width() // 2, 275))
                 
-                game_surface.blit(box_surface, (SCREEN_WIDTH // 2 - box_w // 2, SCREEN_HEIGHT // 2 - 100))
+                game_surface.blit(box_surface, (SCREEN_WIDTH // 2 - box_w // 2, SCREEN_HEIGHT // 2 - 160))
 
         # ==============================================================================
         #                             STATE: GAME OVER
@@ -851,46 +1006,114 @@ def main():
             game_over_timer += 1
             
             # Still draw road environment static under game over filter
-            # Draw road in center
             game_surface.fill((10, 70, 20)) # dimmed green
             pygame.draw.rect(game_surface, (25, 25, 25), (SCREEN_WIDTH//2 - ROAD_WIDTH//2, 0, ROAD_WIDTH, SCREEN_HEIGHT))
             pygame.draw.rect(game_surface, (120, 0, 0), (SCREEN_WIDTH//2 - ROAD_WIDTH//2 - 5, 0, 5, SCREEN_HEIGHT))
             pygame.draw.rect(game_surface, (120, 0, 0), (SCREEN_WIDTH//2 + ROAD_WIDTH//2, 0, 5, SCREEN_HEIGHT))
             
-            # Draw explosion particles continuing to fly
             for p in particles:
                 p.update()
                 p.draw(game_surface)
                 
-            # Draw player car remnants (slightly blackened)
             draw_f1_car(game_surface, int(player_x), PLAYER_Y, (80, 10, 10), is_player=True, drs_active=False)
             
-            # Game Over translucent overlay
             over_panel = pygame.Surface((500, 300), pygame.SRCALPHA)
             over_panel.fill((15, 0, 0, 220))
             pygame.draw.rect(over_panel, (255, 50, 50), (0, 0, 500, 300), 2, border_radius=10)
             
-            go_text = font_large.render("GAME OVER", True, (255, 40, 40))
-            over_panel.blit(go_text, (250 - go_text.get_width()//2, 30))
-            
-            res_txt = font_medium.render(f"Distance: {int(score)} meters", True, (255, 255, 255))
-            over_panel.blit(res_txt, (250 - res_txt.get_width()//2, 120))
-            
-            best_txt = font_medium.render(f"Personal Best: {highscore}m", True, (255, 215, 0))
-            over_panel.blit(best_txt, (250 - best_txt.get_width()//2, 160))
-            
+            if game_mode == "ENDLESS":
+                go_text = font_large.render("GAME OVER", True, (255, 40, 40))
+                over_panel.blit(go_text, (250 - go_text.get_width()//2, 30))
+                
+                res_txt = font_medium.render(f"Distance: {int(score)} meters", True, (255, 255, 255))
+                over_panel.blit(res_txt, (250 - res_txt.get_width()//2, 120))
+                
+                best_txt = font_medium.render(f"Personal Best: {highscore}m", True, (255, 215, 0))
+                over_panel.blit(best_txt, (250 - best_txt.get_width()//2, 160))
+            else:
+                go_text = font_large.render("DID NOT FINISH", True, (255, 40, 40))
+                over_panel.blit(go_text, (250 - go_text.get_width()//2, 30))
+                
+                res_txt = font_medium.render(f"Distance: {int(score)}m / {int(TIME_TRIAL_DISTANCE)}m", True, (255, 255, 255))
+                over_panel.blit(res_txt, (250 - res_txt.get_width()//2, 120))
+                
+                bt_str = f"{best_time:.2f}s" if best_time < 9999.0 else "--.--s"
+                best_txt = font_medium.render(f"Target Track Best: {bt_str}", True, (255, 215, 0))
+                over_panel.blit(best_txt, (250 - best_txt.get_width()//2, 160))
+                
             game_surface.blit(over_panel, (SCREEN_WIDTH//2 - 250, 160))
             
             # Prompt user to restart with gesture (after a short cooldown)
             if game_over_timer > 90: # ~1.5s
                 if int(time.time() * 2) % 2 == 0:
-                    restart_txt = font_medium.render("MAKE FINGER GUNS TO RESTART", True, (0, 255, 255))
+                    restart_txt = font_medium.render("MAKE FINGER GUNS FOR MENU", True, (0, 255, 255))
                     game_surface.blit(restart_txt, (SCREEN_WIDTH//2 - restart_txt.get_width()//2, 510))
                 
                 # Check for restart trigger
                 if drs_input:
-                    state = "PLAYING"
-                    reset_game()
+                    state = "START_SCREEN"
+
+        # ==============================================================================
+        #                             STATE: TIME TRIAL COMPLETE
+        # ==============================================================================
+        elif state == "TIME_TRIAL_COMPLETE":
+            game_over_timer += 1
+            
+            # Still draw road environment static
+            game_surface.fill((10, 70, 20)) # dimmed green
+            pygame.draw.rect(game_surface, (25, 25, 25), (SCREEN_WIDTH//2 - ROAD_WIDTH//2, 0, ROAD_WIDTH, SCREEN_HEIGHT))
+            pygame.draw.rect(game_surface, (0, 180, 0), (SCREEN_WIDTH//2 - ROAD_WIDTH//2 - 5, 0, 5, SCREEN_HEIGHT))
+            pygame.draw.rect(game_surface, (0, 180, 0), (SCREEN_WIDTH//2 + ROAD_WIDTH//2, 0, 5, SCREEN_HEIGHT))
+            
+            for p in particles:
+                p.update()
+                p.draw(game_surface)
+                
+            # Draw player car safely parked/celebrating
+            draw_f1_car(game_surface, int(player_x), PLAYER_Y, (230, 20, 20), is_player=True, drs_active=True)
+            
+            # Confetti particles!
+            if random.randint(1, 4) == 1:
+                particles.append(Particle(
+                    x=random.randint(50, SCREEN_WIDTH - 50),
+                    y=0,
+                    dx=random.uniform(-1, 1),
+                    dy=random.uniform(2, 5),
+                    color=random.choice([(255, 215, 0), (0, 255, 255), (0, 255, 100), (255, 255, 255)]),
+                    size=random.randint(4, 8),
+                    life=random.randint(120, 180),
+                    decay_type='size'
+                ))
+            
+            comp_panel = pygame.Surface((550, 320), pygame.SRCALPHA)
+            comp_panel.fill((10, 25, 15, 230)) # deep green semi-transparent
+            pygame.draw.rect(comp_panel, (50, 255, 50), (0, 0, 550, 320), 2, border_radius=10)
+            
+            win_text = font_large.render("STAGE FINISHED!", True, (50, 255, 50))
+            comp_panel.blit(win_text, (275 - win_text.get_width()//2, 30))
+            
+            time_txt = font_medium.render(f"Your Time: {time_trial_elapsed:.3f} seconds", True, (255, 255, 255))
+            comp_panel.blit(time_txt, (275 - time_txt.get_width()//2, 120))
+            
+            best_txt = font_medium.render(f"Personal Best: {best_time:.3f}s", True, (255, 215, 0))
+            comp_panel.blit(best_txt, (275 - best_txt.get_width()//2, 170))
+            
+            if new_record:
+                rec_txt = font_medium.render("★ NEW TRACK RECORD! ★", True, (255, 215, 0))
+                if int(time.time() * 3) % 2 == 0:
+                    comp_panel.blit(rec_txt, (275 - rec_txt.get_width()//2, 220))
+            
+            game_surface.blit(comp_panel, (SCREEN_WIDTH//2 - 275, 150))
+            
+            # Prompt user to return to menu
+            if game_over_timer > 90: # ~1.5s
+                if int(time.time() * 2) % 2 == 0:
+                    restart_txt = font_medium.render("MAKE FINGER GUNS FOR MENU", True, (0, 255, 255))
+                    game_surface.blit(restart_txt, (SCREEN_WIDTH//2 - restart_txt.get_width()//2, 510))
+                
+                # Check for return to menu trigger
+                if drs_input:
+                    state = "START_SCREEN"
 
         # ==============================================================================
         #                               HUD OVERLAY
@@ -970,29 +1193,14 @@ def main():
         # Assemble game_surface
         game_surface.blit(hud_surface, (0, SCREEN_HEIGHT - 100))
 
-        # ==============================================================================
-        #                           CAMERA PIP VIEWPORT
-        # ==============================================================================
-        # Render the resized webcam feed overlay in top-right corner
-        if cam_frame is not None:
-            try:
-                # Convert raw camera frame array to Pygame Surface
-                pip_surface = pygame.image.frombuffer(cam_frame.tobytes(), (200, 150), 'RGB')
-                
-                # Draw neon cyan borders around camera feed
-                pygame.draw.rect(game_surface, (0, 255, 255), (SCREEN_WIDTH - 213, 12, 204, 154), 2, border_radius=4)
-                game_surface.blit(pip_surface, (SCREEN_WIDTH - 211, 14))
-                
-                # Label overlay
-                lbl = font_small.render("GESTURE CAMERA", True, (0, 255, 255))
-                pygame.draw.rect(game_surface, (10, 10, 20), (SCREEN_WIDTH - 211, 14, 140, 22))
-                game_surface.blit(lbl, (SCREEN_WIDTH - 206, 16))
-            except Exception as e:
-                print(f"Error drawing PIP: {e}")
-
-        # Blit the entire gameplay surface with Screen Shake offsets to the screen
+        # Blit the entire gameplay surface with Screen Shake offsets to the screen (supports fullscreen scaling)
         screen.fill((0, 0, 0))
-        screen.blit(game_surface, (screen_shake_x, screen_shake_y))
+        if fullscreen:
+            scr_w, scr_h = screen.get_size()
+            scaled_surf = pygame.transform.scale(game_surface, (scr_w, scr_h))
+            screen.blit(scaled_surf, (screen_shake_x, screen_shake_y))
+        else:
+            screen.blit(game_surface, (screen_shake_x, screen_shake_y))
         
         pygame.display.flip()
         clock.tick(60)
