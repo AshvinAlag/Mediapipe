@@ -123,33 +123,26 @@ def check_finger_gun(landmarks, handedness):
     landmarks: list of NormalizedLandmark objects from MediaPipe.
     handedness: 'Left' or 'Right'.
     """
-    if handedness == 'Right':
-        is_palm_facing = landmarks[5].x < landmarks[17].x
-    else:
-        is_palm_facing = landmarks[5].x > landmarks[17].x
+    def dist(p1, p2):
+        return math.hypot(p1.x - p2.x, p1.y - p2.y)
 
-    thumb_extended = False
-    if handedness == 'Right':
-        if is_palm_facing:
-            if landmarks[4].x < landmarks[3].x:
-                thumb_extended = True
-        else:
-            if landmarks[4].x > landmarks[3].x:
-                thumb_extended = True
-    else:
-        if is_palm_facing:
-            if landmarks[4].x > landmarks[3].x:
-                thumb_extended = True
-        else:
-            if landmarks[4].x < landmarks[3].x:
-                thumb_extended = True
+    # Index: tip (8) to MCP (5) distance vs PIP (6) to MCP (5)
+    index_extended = dist(landmarks[8], landmarks[5]) > dist(landmarks[6], landmarks[5]) * 1.1
 
-    index_extended = landmarks[8].y < landmarks[6].y
-    middle_extended = landmarks[12].y < landmarks[10].y
-    ring_extended = landmarks[16].y < landmarks[14].y
-    pinky_extended = landmarks[20].y < landmarks[18].y
+    # Middle: tip (12) to MCP (9) vs PIP (10) to MCP (9)
+    middle_folded = dist(landmarks[12], landmarks[9]) < dist(landmarks[10], landmarks[9]) * 0.95
 
-    return thumb_extended and index_extended and not middle_extended and not ring_extended and not pinky_extended
+    # Ring: tip (16) to MCP (13) vs PIP (14) to MCP (13)
+    ring_folded = dist(landmarks[16], landmarks[13]) < dist(landmarks[14], landmarks[13]) * 0.95
+
+    # Pinky: tip (20) to MCP (17) vs PIP (18) to MCP (17)
+    pinky_folded = dist(landmarks[20], landmarks[17]) < dist(landmarks[18], landmarks[17]) * 0.95
+
+    # Thumb: tip (4) to index MCP (5) vs IP (3) to index MCP (5)
+    # Rotation-invariant check inspired by the handsfree template
+    thumb_extended = dist(landmarks[4], landmarks[5]) > dist(landmarks[3], landmarks[5]) * 1.05
+
+    return thumb_extended and index_extended and middle_folded and ring_folded and pinky_folded
 
 def camera_thread_worker():
     global running, hand_state, camera_error
